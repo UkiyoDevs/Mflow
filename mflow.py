@@ -27,11 +27,6 @@ PORT = 80
 LOG_LEVEL = "INFO"
 
 
-# Custom exception for incomplete chunks
-class IncompleteChunkError(Exception):
-    pass
-
-
 # Colored logging formatter
 class ColoredFormatter(logging.Formatter):
     LEVEL_COLORS = {
@@ -55,27 +50,34 @@ handler.setFormatter(ColoredFormatter(fmt="%(asctime)s [%(levelname).4s] %(messa
 logger.handlers.clear()
 logger.addHandler(handler)
 
-def get_base_url(url: str) -> str:
+
+def get_base_url(url: str, have_path=True) -> str:
     """
     返回不包含参数(query)和锚点(fragment)的 URL 部分。
     """
     parts = urlparse(url)
-    clean_parts = (parts.scheme, parts.netloc, parts.path, '', '', '')
-    return urlunparse(clean_parts)
+    if have_path:
+        return urlunparse((parts.scheme, parts.netloc, parts.path, "", "", ""))
+    else:
+        return urlunparse((parts.scheme, parts.netloc, "", "", "", ""))
+
 
 class LinkInfo:
-    def __init__(self, url: str):
+    def __init__(self, url: str, client=None):
         self.original_url = url
         self.redirect_url = url
         self.support_range = False
         self.filesize: Optional[int] = None
         self.filename: Optional[str] = None
         self.minetype = "application/octet-stream"
-        self.connector = TCPConnector(limit=MAX_WORKERS, keepalive_timeout=60)
-        self.client = ClientSession(
-            connector=self.connector,
-            timeout=ClientTimeout(total=None),
-            headers={"User-Agent": USER_AGENT},
+        self.client = (
+            ClientSession(
+                connector=TCPConnector(limit=MAX_WORKERS, keepalive_timeout=60),
+                timeout=ClientTimeout(total=None),
+                headers={"User-Agent": USER_AGENT},
+            )
+            if client is None
+            else client
         )
         logger.debug(f"LinkInfo initialized for {url}")
 
@@ -88,7 +90,9 @@ async def update_info(info: LinkInfo, request_id: str) -> Optional[web.Response]
     sess = info.client
     current_url = info.original_url
     try:
-        logger.info(f"[{request_id}] Checking resource info: {str(get_base_url(current_url))}")
+        logger.debug(
+            f"[{request_id}] Checking resource info: {str(get_base_url(current_url))}"
+        )
         resp = await sess.head(current_url, allow_redirects=False)
         depth = 0
 
@@ -104,7 +108,9 @@ async def update_info(info: LinkInfo, request_id: str) -> Optional[web.Response]
 
         if info.redirect_url != current_url:
             info.redirect_url = current_url
-            logger.info(f"[{request_id}] Redirected to {str(get_base_url(current_url))}")
+            logger.info(
+                f"[{request_id}] Redirected to {str(get_base_url(current_url))}"
+            )
 
         # 检查是否支持 Range
         headers = {"Range": "bytes=0-"}
@@ -174,9 +180,15 @@ def parse_range(header: str) -> Tuple[int, Optional[int]]:
     return start, end
 
 
+# Custom exception for incomplete chunks
+class IncompleteChunkError(Exception):
+    pass
+
+
 class MultiFlow:
     def __init__(self):
         self.link_cache: Dict[str, LinkInfo] = {}
+        self.client_cache: Dict[str, ClientSession] = {}
         self.request_counter = 0
         logger.info("MultiFlow controller initialized")
 
@@ -195,9 +207,9 @@ class MultiFlow:
         key = "?url="
         idx = str(request.url).find(key)
         if idx == -1:
-            url = ''
+            url = ""
         else:
-            url = str(request.url)[idx + len(key):]
+            url = str(request.url)[idx + len(key) :]
         # url = request.query.get("url")
         if not url:
             return web.HTTPBadRequest(reason="Missing url parameter")
@@ -212,14 +224,21 @@ class MultiFlow:
 
         # 获取或创建 LinkInfo
         if url not in self.link_cache:
-            logger.info(f"[{request_id}] Cache miss, init LinkInfo")
-            info = LinkInfo(url)
+            logger.info(f"[{request_id}] Link miss, init LinkInfo")
+            base_url = get_base_url(url, False)
+            if base_url in self.client_cache:
+                logger.info(f"[{request_id}] Client hit, share ClientSession")
+                info = LinkInfo(url, self.client_cache[base_url])
+            else:
+                logger.info(f"[{request_id}] Client miss, init ClientSession")
+                info = LinkInfo(url)
             err = await update_info(info, request_id)
             if err:
                 await info.close()
                 return err
             if info.support_range:
                 self.link_cache[url] = info
+                self.client_cache[base_url] = info.client
             else:
                 logger.error("URL unsupport range")
                 return web.HTTPForbidden()
