@@ -7,7 +7,7 @@ import re
 import random
 
 from typing import Dict, Optional, Tuple, Set
-from urllib.parse import unquote, urlparse, quote
+from urllib.parse import unquote, urlparse, quote, urlunparse
 from aiohttp import web, TCPConnector, ClientSession, ClientTimeout, ClientError
 from colorama import init as colorama_init, Fore, Style
 
@@ -55,6 +55,13 @@ handler.setFormatter(ColoredFormatter(fmt="%(asctime)s [%(levelname).4s] %(messa
 logger.handlers.clear()
 logger.addHandler(handler)
 
+def get_base_url(url: str) -> str:
+    """
+    返回不包含参数(query)和锚点(fragment)的 URL 部分。
+    """
+    parts = urlparse(url)
+    clean_parts = (parts.scheme, parts.netloc, parts.path, '', '', '')
+    return urlunparse(clean_parts)
 
 class LinkInfo:
     def __init__(self, url: str):
@@ -81,7 +88,7 @@ async def update_info(info: LinkInfo, request_id: str) -> Optional[web.Response]
     sess = info.client
     current_url = info.original_url
     try:
-        logger.info(f"[{request_id}] Checking resource info: {current_url}")
+        logger.info(f"[{request_id}] Checking resource info: {str(get_base_url(current_url))}")
         resp = await sess.head(current_url, allow_redirects=False)
         depth = 0
 
@@ -97,7 +104,7 @@ async def update_info(info: LinkInfo, request_id: str) -> Optional[web.Response]
 
         if info.redirect_url != current_url:
             info.redirect_url = current_url
-            logger.info(f"[{request_id}] Redirected to {current_url}")
+            logger.info(f"[{request_id}] Redirected to {str(get_base_url(current_url))}")
 
         # 检查是否支持 Range
         headers = {"Range": "bytes=0-"}
@@ -194,7 +201,7 @@ class MultiFlow:
         # url = request.query.get("url")
         if not url:
             return web.HTTPBadRequest(reason="Missing url parameter")
-        logger.info(f"[{request_id}] Incoming stream request: {url}")
+        logger.info(f"[{request_id}] Incoming stream request: {str(get_base_url(url))}")
 
         # 解析 Range
         range_hdr = request.headers.get("Range", "")
