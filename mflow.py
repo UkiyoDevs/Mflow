@@ -8,7 +8,13 @@ import random
 
 from typing import Dict, Optional, Tuple, Set
 from urllib.parse import unquote, urlparse, quote, urlunparse
-from aiohttp import web, TCPConnector, ClientSession, ClientTimeout, ClientError
+from aiohttp import (
+    web,
+    TCPConnector,
+    ClientSession,
+    ClientTimeout,
+    ClientError,
+)
 from colorama import init as colorama_init, Fore, Style
 
 # Initialize colorama
@@ -21,7 +27,7 @@ USER_AGENT = (
 )
 CHUNK_SIZE = 1 << 20  # 1 MB
 MAX_WORKERS = 4  # 并行下载数
-MAX_REDIRECTS = 3  # 最大重定向次数
+MAX_REDIRECTS = 4  # 最大重定向次数
 MAX_RETRIES = 3  # 每个块最大重试次数
 PORT = 80
 LOG_LEVEL = "INFO"
@@ -185,6 +191,11 @@ class IncompleteChunkError(Exception):
     pass
 
 
+# Custom exception for incomplete response
+class IncompleteResponseError(Exception):
+    pass
+
+
 class MultiFlow:
     def __init__(self):
         self.link_cache: Dict[str, LinkInfo] = {}
@@ -277,37 +288,70 @@ class MultiFlow:
         await resp.prepare(request)
         logger.info(f"[{request_id}] Response prepared, streaming...")
 
-        next_pos = start
         next_chunk_start = start
-        buffer: Dict[int, bytes] = {}
         in_flight: Set[asyncio.Task] = set()
         chunk_id = 1
+        stream_chunk_id = 1
+        lock = asyncio.Lock()
 
         # 下载一个 chunk 的协程
         async def fetch_chunk(chunk_start: int, id: int):
+            nonlocal stream_chunk_id
             chunk_end = min(chunk_start + CHUNK_SIZE - 1, end)
-            expected_len = chunk_end - chunk_start + 1
+            current_start = chunk_start
+            buffer = bytearray()
+            buffer_written = False
 
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     async with info.client.get(
                         info.redirect_url,
-                        headers={"Range": f"bytes={chunk_start}-{chunk_end}"},
+                        headers={"Range": f"bytes={current_start}-{chunk_end}"},
                     ) as r:
-                        data = await r.read()
-                        # 验证长度
-                        if len(data) != expected_len:
+                        if r.status != 206:
+                            r.release()
                             raise IncompleteChunkError(
-                                f"chunk {chunk_start}-{chunk_end} len={len(data)} "
-                                f"!= expected {expected_len}"
+                                f"bad response status {r.status}"
                             )
-                        logger.debug(
-                            f"[{request_id}] Chunk({id}) {chunk_start}-{chunk_end} OK"
-                        )
-                        return chunk_start, data
+                        async for data in r.content.iter_any():
+                            async with lock:
+                                if stream_chunk_id == id:
+                                    try:
+                                        if not buffer_written:
+                                            await resp.write(buffer)
+                                            buffer_written = True
+                                        await resp.write(data)
+                                    except Exception as e:
+                                        raise IncompleteResponseError(str(e))
+                                else:
+                                    buffer.extend(data)
+                                    await asyncio.sleep(0.1)
+                            current_start += len(data)
 
-                except (ClientError, asyncio.TimeoutError, IncompleteChunkError) as e:
-                    backoff = 0.5 * (2 ** (attempt - 1))
+                        while True:
+                            async with lock:
+                                if stream_chunk_id == id:
+                                    if not buffer_written:
+                                        try:
+                                            await resp.write(buffer)
+                                        except Exception as e:
+                                            raise IncompleteResponseError(str(e))
+                                        buffer_written = False
+                                    stream_chunk_id += 1
+                                    break
+                                else:
+                                    await asyncio.sleep(0.1)
+
+                        if current_start - 1 == chunk_end:
+                            logger.debug(
+                                f"[{request_id}] Chunk({id}) {chunk_start}-{chunk_end} OK"
+                            )
+                            return
+                        else:
+                            raise IncompleteChunkError("bad data length")
+
+                except (ClientError, IncompleteChunkError) as e:
+                    backoff = 0.8 * (2 ** (attempt - 1))
                     jitter = random.uniform(0, 0.1 * attempt)
                     delay = backoff + jitter
                     logger.warning(
@@ -316,17 +360,21 @@ class MultiFlow:
                         f"retry after {delay:.2f}s"
                     )
                     await asyncio.sleep(delay)
+
                 except asyncio.CancelledError:
                     # 取消时直接退出
-                    return None
-                except Exception:
-                    pass
+                    return
 
-            logger.error(
+                except IncompleteResponseError:
+                    raise
+
+                except Exception as e:
+                    logger.error(f"[{request_id}] Chunk({id}) unknown error: {e}")
+
+            raise IncompleteChunkError(
                 f"[{request_id}] Chunk {chunk_start}-{chunk_end} failed after "
                 f"{MAX_RETRIES} attempts"
             )
-            raise IncompleteChunkError
 
         # 工具：取消所有挂起任务
         async def cancel_all():
@@ -345,26 +393,14 @@ class MultiFlow:
                 # 保持优先级
                 await asyncio.sleep(0.1)
 
-            sent = 0
-            # 依次写回客户端
+            # 滑动窗口以创建任务
             while in_flight:
                 done, _ = await asyncio.wait(
                     in_flight, return_when=asyncio.FIRST_COMPLETED
                 )
                 for t in done:
                     in_flight.remove(t)
-                    res = await t
-                    if not res:
-                        continue
-                    pos, data = res
-                    buffer[pos] = data
-
-                # 按序写出
-                while next_pos in buffer:
-                    chunk = buffer.pop(next_pos)
-                    await resp.write(chunk)
-                    sent += len(chunk)
-                    next_pos += len(chunk)
+                    await t
 
                 # 补充新任务
                 while len(in_flight) < MAX_WORKERS and next_chunk_start <= end:
@@ -373,24 +409,18 @@ class MultiFlow:
                     next_chunk_start += CHUNK_SIZE
                     chunk_id += 1
 
-            logger.info(f"[{request_id}] Streaming done, sent {sent}/{total_len} bytes")
+            logger.info(f"[{request_id}] Streaming done, sent {total_len} bytes")
 
-        except asyncio.CancelledError:
-            # 客户端中断
-            logger.info(f"[{request_id}] Client cancelled, aborting tasks")
-        except IncompleteChunkError:
-            # 错误已经打印
-            pass
         except Exception as e:
             logger.error(f"[{request_id}] Streaming error: {e}")
 
         await cancel_all()
-
         logger.info(f"[{request_id}] Response end")
+
         return resp
 
 
-def init_app():
+def init_var():
     global CHUNK_SIZE, PORT, LOG_LEVEL, MAX_WORKERS, MAX_RETRIES
 
     parser = argparse.ArgumentParser(
@@ -446,15 +476,19 @@ def init_app():
         parser.error(
             f"Invalid chunk size format: {args.chunk_size}. Use numbers, K, or M."
         )
-        return None
+        return False
 
     # Only change in there
     PORT = int(args.port)
     CHUNK_SIZE = int(args.chunk_size)
     MAX_WORKERS = int(args.connections)
     MAX_RETRIES = int(args.retry)
-    LOG_LEVEL = args.log_level
+    LOG_LEVEL = str(args.log_level)
 
+    return True
+
+
+def init_app():
     logger.setLevel(LOG_LEVEL)
     logger.info("Initializing application")
 
@@ -468,11 +502,10 @@ def init_app():
 
 
 def main():
-    app = init_app()
-    if app is None:
-        return
-    web.run_app(app, host="0.0.0.0", port=PORT, access_log=None, print=None)
+    if init_var():
+        web.run_app(init_app(), host="0.0.0.0", port=PORT, access_log=None, print=None)
 
 
 if __name__ == "__main__":
-    main()
+    LOG_LEVEL = "DEBUG"
+    web.run_app(init_app(), host="0.0.0.0", port=PORT, access_log=None, print=None)
