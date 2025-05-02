@@ -17,7 +17,7 @@ A CLI tool that accelerates media streaming by parallelizing range requests. Act
 ## Features
 
 - 🚀 Parallel chunk downloading
-- 🔄 Automatic retry mechanism (3 retries/chunk)
+- 🔄 Automatic retry mechanism (4 retries/chunk)
 - 🔗 Connection pooling & reuse
 - 🧩 Dynamic chunk sizing (default: 1MB chunks)
 - 🔄 Follows redirects (max 3 hops)

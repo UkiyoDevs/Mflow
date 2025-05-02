@@ -17,9 +17,6 @@ from aiohttp import (
 )
 from colorama import init as colorama_init, Fore, Style
 
-# Initialize colorama
-colorama_init(autoreset=True)
-
 # Constants
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -27,10 +24,10 @@ USER_AGENT = (
 )
 CHUNK_SIZE = 1 << 20  # 1 MB
 MAX_WORKERS = 4  # 并行下载数
-MAX_REDIRECTS = 4  # 最大重定向次数
-MAX_RETRIES = 3  # 每个块最大重试次数
-PORT = 80
+MAX_REDIRECTS = 3  # 最大重定向次数
+MAX_RETRIES = 4  # 每个块最大重试次数
 LOG_LEVEL = "INFO"
+PORT = 80
 
 
 # Colored logging formatter
@@ -47,14 +44,6 @@ class ColoredFormatter(logging.Formatter):
         color = self.LEVEL_COLORS.get(record.levelno, "")
         msg = super().format(record)
         return f"{color}{msg}{Style.RESET_ALL}"
-
-
-# Configure logger
-logger = logging.getLogger("Mflow")
-handler = logging.StreamHandler()
-handler.setFormatter(ColoredFormatter(fmt="%(asctime)s [%(levelname).4s] %(message)s"))
-logger.handlers.clear()
-logger.addHandler(handler)
 
 
 def get_base_url(url: str, have_path=True) -> str:
@@ -293,10 +282,11 @@ class MultiFlow:
         chunk_id = 1
         stream_chunk_id = 1
         lock = asyncio.Lock()
+        updateInfo = True
 
         # 下载一个 chunk 的协程
         async def fetch_chunk(chunk_start: int, id: int):
-            nonlocal stream_chunk_id
+            nonlocal stream_chunk_id, updateInfo
             chunk_end = min(chunk_start + CHUNK_SIZE - 1, end)
             current_start = chunk_start
             buffer = bytearray()
@@ -313,34 +303,37 @@ class MultiFlow:
                             raise IncompleteChunkError(
                                 f"bad response status {r.status}"
                             )
-                        async for data in r.content.iter_any():
-                            async with lock:
-                                if stream_chunk_id == id:
-                                    try:
-                                        if not buffer_written:
-                                            await resp.write(buffer)
-                                            buffer_written = True
-                                        await resp.write(data)
-                                    except Exception as e:
-                                        raise IncompleteResponseError(str(e))
-                                else:
-                                    buffer.extend(data)
-                                    await asyncio.sleep(0.1)
-                            current_start += len(data)
+                        updateInfo = False
 
-                        while True:
-                            async with lock:
-                                if stream_chunk_id == id:
-                                    if not buffer_written:
-                                        try:
-                                            await resp.write(buffer)
-                                        except Exception as e:
-                                            raise IncompleteResponseError(str(e))
-                                        buffer_written = False
+                        async def data_generator():
+                            async for data in r.content.iter_any():
+                                if data:
+                                    yield data
+                            while True:
+                                yield b""
+
+                        async for data in data_generator():
+                            await lock.acquire()
+                            if stream_chunk_id != id:
+                                lock.release()
+                                buffer.extend(data)
+                                current_start += len(data)
+                                await asyncio.sleep(0.1)
+                                continue
+                            try:
+                                if not buffer_written:
+                                    await resp.write(buffer)
+                                    buffer_written = True
+                                if data:
+                                    await resp.write(data)
+                                    current_start += len(data)
+                                else:
                                     stream_chunk_id += 1
                                     break
-                                else:
-                                    await asyncio.sleep(0.1)
+                            except Exception as e:
+                                raise IncompleteResponseError(str(e))
+                            finally:
+                                lock.release()
 
                         if current_start - 1 == chunk_end:
                             logger.debug(
@@ -376,7 +369,7 @@ class MultiFlow:
                 f"{MAX_RETRIES} attempts"
             )
 
-        # 工具：取消所有挂起任务
+        # 取消所有挂起任务
         async def cancel_all():
             for t in in_flight:
                 t.cancel()
@@ -416,6 +409,10 @@ class MultiFlow:
 
         await cancel_all()
         logger.info(f"[{request_id}] Response end")
+
+        if updateInfo:
+            logger.warning(f"[{request_id}] Too many errors, try to update LinkInfo")
+            await update_info(info, request_id)
 
         return resp
 
@@ -489,6 +486,18 @@ def init_var():
 
 
 def init_app():
+    global logger
+
+    # Initialize colorama
+    colorama_init(autoreset=True)
+    # Configure logger
+    logger = logging.getLogger("Mflow")
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        ColoredFormatter(fmt="%(asctime)s [%(levelname).4s] %(message)s")
+    )
+    logger.handlers.clear()
+    logger.addHandler(handler)
     logger.setLevel(LOG_LEVEL)
     logger.info("Initializing application")
 
