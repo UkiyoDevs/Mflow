@@ -384,8 +384,6 @@ class MultiFlow:
                 in_flight.add(t)
                 next_chunk_start += CHUNK_SIZE
                 chunk_id += 1
-                # 保持优先级
-                await asyncio.sleep(0.1)
 
             # 滑动窗口以创建任务
             while in_flight:
