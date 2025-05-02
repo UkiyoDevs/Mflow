@@ -22,6 +22,7 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 )
+VERSION = "1.1.2"
 CHUNK_SIZE = 1 << 20  # 1 MB
 MAX_WORKERS = 4  # 并行下载数
 MAX_REDIRECTS = 3  # 最大重定向次数
@@ -365,7 +366,7 @@ class MultiFlow:
                     logger.error(f"[{request_id}] Chunk({id}) unknown error: {e}")
 
             raise IncompleteChunkError(
-                f"[{request_id}] Chunk {chunk_start}-{chunk_end} failed after "
+                f"Chunk({id}) {chunk_start}-{chunk_end} failed after "
                 f"{MAX_RETRIES} attempts"
             )
 
@@ -424,41 +425,46 @@ def init_var():
         description="Multi Flow - Concurrent Streaming Proxy"
     )
     parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version="Mflow v" + VERSION,
+        help="show program's version and exit",
+    )
+    parser.add_argument(
         "-p",
         "--port",
         type=int,
         default=PORT,
-        help=f"Port to listen on (default: {PORT})",
+        help=f"port to listen on (default: {PORT})",
     )
     parser.add_argument(
         "-r",
         "--retry",
         default=MAX_RETRIES,
-        help=f"Maximum number of retries (default: {MAX_RETRIES})",
+        help=f"maximum number of retries (default: {MAX_RETRIES})",
     )
     parser.add_argument(
         "-c",
         "--connections",
         type=int,
         default=MAX_WORKERS,
-        help=f"Number of concurrent connections per stream (default: {MAX_WORKERS})",
+        help=f"number of concurrent connections per stream (default: {MAX_WORKERS})",
     )
     parser.add_argument(
         "-s",
         "--chunk-size",
         type=str,
         default=f"{CHUNK_SIZE // 1024 // 1024}M",
-        help="Size of chunks for parallel downloads (e.g., 1M, 512K) (default: 1M)",
+        help="size of chunks for parallel downloads (e.g. 1M, 512K) (default: 1M)",
     )
     parser.add_argument(
         "--log-level",
         default=LOG_LEVEL,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help=f"Set logging level (default: {LOG_LEVEL})",
+        help=f"set logging level (default: {LOG_LEVEL})",
     )
     args = parser.parse_args()
-    if hasattr(args, "help"):
-        return None
 
     # --- Parse Chunk Size ---
     size_str: str = args.chunk_size.upper()
@@ -516,5 +522,6 @@ def main():
 
 
 if __name__ == "__main__":
-    LOG_LEVEL = "DEBUG"
-    web.run_app(init_app(), host="0.0.0.0", port=PORT, access_log=None, print=None)
+    if init_var():
+        LOG_LEVEL = "DEBUG"
+        web.run_app(init_app(), host="0.0.0.0", port=PORT, access_log=None, print=None)
