@@ -1,6 +1,6 @@
 [project]
 name = "mflow"
-version = "1.2.0"
+version = "1.2.1"
 description = "Multi Flow - Concurrent Streaming Proxy"
 license = { text = "Apache-2.0" }
 authors = [
@@ -16,3 +16,6 @@ dependencies = [
 
 [project.scripts]
 mflow = "mflow:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }

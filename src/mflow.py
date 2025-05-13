@@ -29,7 +29,7 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 )
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 CHUNK_SIZE = 1 << 20  # 1 MB
 MAX_WORKERS = 4  # 并行下载数
 MAX_REDIRECTS = 3  # 最大重定向次数
