@@ -6,8 +6,8 @@ import os
 import re
 import random
 
-from typing import Dict, Optional, Tuple, Set
-from urllib.parse import unquote, urlparse, quote, urlunparse
+from typing import Dict, Optional, Set
+from urllib.parse import unquote, urlparse, quote
 from aiohttp import (
     web,
     TCPConnector,
@@ -15,47 +15,29 @@ from aiohttp import (
     ClientTimeout,
     ClientError,
 )
-from colorama import init as colorama_init, Fore, Style
+from colorama import init as colorama_init
+from utils import (
+    SafeMemory,
+    ColoredFormatter,
+    AsyncSafeStore,
+    get_base_url,
+    parse_range,
+)
 
 # Constants
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 )
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 CHUNK_SIZE = 1 << 20  # 1 MB
 MAX_WORKERS = 4  # 并行下载数
 MAX_REDIRECTS = 3  # 最大重定向次数
-MAX_RETRIES = 4  # 每个块最大重试次数
-LOG_LEVEL = "INFO"
-PORT = 80
-
-
-# Colored logging formatter
-class ColoredFormatter(logging.Formatter):
-    LEVEL_COLORS = {
-        logging.DEBUG: Fore.CYAN,
-        logging.INFO: Fore.WHITE,
-        logging.WARNING: Fore.YELLOW,
-        logging.ERROR: Fore.RED,
-        logging.CRITICAL: Fore.MAGENTA,
-    }
-
-    def format(self, record):
-        color = self.LEVEL_COLORS.get(record.levelno, "")
-        msg = super().format(record)
-        return f"{color}{msg}{Style.RESET_ALL}"
-
-
-def get_base_url(url: str, have_path=True) -> str:
-    """
-    返回不包含参数(query)和锚点(fragment)的 URL 部分。
-    """
-    parts = urlparse(url)
-    if have_path:
-        return urlunparse((parts.scheme, parts.netloc, parts.path, "", "", ""))
-    else:
-        return urlunparse((parts.scheme, parts.netloc, "", "", "", ""))
+MAX_RETRIES = 5  # 每个块最大重试次数
+MAX_CACHE_ON_SIZE = 1 << 30  # 1 GB
+CACHE_ON_ON = False  # 是否启用缓存
+LOG_LEVEL = "INFO"  # 日志级别
+PORT = 80  # 默认端口
 
 
 class LinkInfo:
@@ -75,6 +57,7 @@ class LinkInfo:
             if client is None
             else client
         )
+        self.cache = SafeMemory()
         logger.debug(f"LinkInfo initialized for {url}")
 
     async def close(self):
@@ -165,15 +148,6 @@ async def update_info(info: LinkInfo, request_id: str) -> Optional[web.Response]
     except Exception as e:
         logger.error(f"[{request_id}] Unexpected error: {e}", exc_info=True)
         return web.HTTPInternalServerError()
-
-
-def parse_range(header: str) -> Tuple[int, Optional[int]]:
-    m = re.match(r"bytes=(\d+)-(\d+)?", header or "")
-    if not m:
-        return 0, None
-    start = int(m.group(1))
-    end = int(m.group(2)) if m.group(2) else None
-    return start, end
 
 
 # Custom exception for incomplete chunks
@@ -281,8 +255,7 @@ class MultiFlow:
         next_chunk_start = start
         in_flight: Set[asyncio.Task] = set()
         chunk_id = 1
-        stream_chunk_id = 1
-        lock = asyncio.Lock()
+        stream_chunk_id = AsyncSafeStore(1)
         updateInfo = True
 
         # 下载一个 chunk 的协程
@@ -293,6 +266,48 @@ class MultiFlow:
             buffer = bytearray()
             buffer_written = False
 
+            if CACHE_ON:
+                try:
+                    view = await info.cache.view(chunk_start, chunk_end + 1)
+                    buffer += view
+                    current_start += len(view)
+                    view.release()
+                    updateInfo = False
+
+                    while True:
+                        if await stream_chunk_id.get() == id:
+                            try:
+                                await resp.write(buffer)
+                                await stream_chunk_id.set(
+                                    await stream_chunk_id.get() + 1
+                                )
+                                break
+                            except Exception as e:
+                                raise IncompleteResponseError(str(e))
+                        await asyncio.sleep(0.1)
+
+                    logger.debug(
+                        f"[{request_id}] Chunk({id}) {chunk_start}-{chunk_end} Cache hit"
+                    )
+                    return
+
+                except ValueError:
+                    offset = 1 << 14  # 16K
+                    for i in range(chunk_start, chunk_end + 1, offset):
+                        try:
+                            view = await info.cache.view(i, i + offset)
+                            buffer += view
+                            current_start += len(view)
+                            view.release()
+                        except ValueError:
+                            break
+
+                except asyncio.CancelledError:
+                    return
+
+                except Exception as e:
+                    raise
+
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     async with info.client.get(
@@ -300,7 +315,6 @@ class MultiFlow:
                         headers={"Range": f"bytes={current_start}-{chunk_end}"},
                     ) as r:
                         if r.status != 206:
-                            r.release()
                             raise IncompleteChunkError(
                                 f"bad response status {r.status}"
                             )
@@ -314,27 +328,30 @@ class MultiFlow:
                                 yield b""
 
                         async for data in data_generator():
-                            await lock.acquire()
-                            if stream_chunk_id != id:
-                                lock.release()
+                            if await stream_chunk_id.get() != id:
                                 buffer.extend(data)
+                                if CACHE_ON:
+                                    await info.cache.write(current_start, data)
                                 current_start += len(data)
                                 await asyncio.sleep(0.1)
                                 continue
+
                             try:
                                 if not buffer_written:
                                     await resp.write(buffer)
                                     buffer_written = True
                                 if data:
                                     await resp.write(data)
+                                    if CACHE_ON:
+                                        await info.cache.write(current_start, data)
                                     current_start += len(data)
                                 else:
-                                    stream_chunk_id += 1
+                                    await stream_chunk_id.set(
+                                        await stream_chunk_id.get() + 1
+                                    )
                                     break
                             except Exception as e:
                                 raise IncompleteResponseError(str(e))
-                            finally:
-                                lock.release()
 
                         if current_start - 1 == chunk_end:
                             logger.debug(
@@ -417,7 +434,7 @@ class MultiFlow:
 
 
 def init_var():
-    global CHUNK_SIZE, PORT, LOG_LEVEL, MAX_WORKERS, MAX_RETRIES
+    global CHUNK_SIZE, PORT, LOG_LEVEL, MAX_WORKERS, MAX_RETRIES, CACHE_ON
 
     parser = argparse.ArgumentParser(
         description="Multi Flow - Concurrent Streaming Proxy"
@@ -462,6 +479,11 @@ def init_var():
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help=f"set logging level (default: {LOG_LEVEL})",
     )
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="enable cache for streaming (default: False)",
+    )
     args = parser.parse_args()
 
     # --- Parse Chunk Size ---
@@ -485,6 +507,7 @@ def init_var():
     MAX_WORKERS = int(args.connections)
     MAX_RETRIES = int(args.retry)
     LOG_LEVEL = str(args.log_level)
+    CACHE_ON = bool(args.cache)
 
     return True
 
@@ -508,7 +531,7 @@ def init_app():
     mf = MultiFlow()
     app = web.Application()
     app.router.add_get("/stream", mf.handle_request)
-    app.on_cleanup.append(lambda app: mf.close())
+    app.on_cleanup.append(lambda _: mf.close())
 
     logger.info(f"Starting server on 0.0.0.0:{PORT}")
     return app
@@ -522,4 +545,6 @@ def main():
 if __name__ == "__main__":
     if init_var():
         LOG_LEVEL = "DEBUG"
+        MAX_WORKERS = 6
+        CACHE_ON = True
         web.run_app(init_app(), host="0.0.0.0", port=PORT, access_log=None, print=None)
